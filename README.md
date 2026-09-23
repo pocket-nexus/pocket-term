@@ -36,7 +36,8 @@ and provenance are in [screenshots](docs/screenshots/README.md).
 Use a Mac and a homebrew-capable 3DS on the same local network. The console
 needs Homebrew Launcher and ftpd. Building requires Bun, Node, Rust through
 rustup, and a running Docker engine. CI uses **Bun 1.3.14 and Node 24**;
-`bun run daemon` starts the Node supervisor and its Bun offload provider.
+`bun run daemon` starts the Node terminal process and Relay authority. The
+explicit offload rollback also starts its Bun provider worker.
 
 PocketJS is pinned as the `vendor/pocketjs` submodule. Its
 [Rust toolchain file](vendor/pocketjs/hosts/3ds/core/rust-toolchain.toml) selects
@@ -52,6 +53,19 @@ bun run 3ds
 bun run mirror
 ```
 
+`bun run 3ds` builds the Relay guest. `bun run 3ds --offload` builds a
+separate rollback guest; transport selection is part of the artifact and a
+guest never probes one transport and falls back to the other.
+
+**The pinned PocketJS 3DS host does not yet publish the native Relay byte
+lane.** The Relay guest, companion and TCP service can be built and tested,
+but a physical 3DS cannot connect to that guest until the host lane lands in
+PocketJS. For current hardware use, build the explicit offload artifact:
+
+```sh
+bun run 3ds --offload
+```
+
 Keep `~/.cargo/bin` on `PATH`. `mirror` builds the optional Mac window; use
 `--no-mirror` when starting the daemon if you do not want desktop windows.
 
@@ -63,15 +77,17 @@ bun run deploy --host 192.168.8.102
 ```
 
 The deploy command installs `dist/3ds/pocketterm-main.3dsx` at
-`/3DS/pocketterm-main.3dsx`, provisions this app's offload key, backs up the
+`/3DS/pocketterm-main.3dsx`, provisions this app's companion key, backs up the
 previous launcher, and downloads the installed files to verify their bytes.
+Build with `--offload` immediately before deploying because that is the
+transport the pinned 3DS host can carry.
 The default FTP port is 5000; use `--ftp-port` if yours differs.
 
 **Exit ftpd and launch Pocket Term from Homebrew Launcher.** Start the Mac
 companion with the same console address:
 
 ```sh
-bun run daemon --device 192.168.8.102
+bun run daemon --offload --device 192.168.8.102
 ```
 
 Keep the companion running while using the terminal. It starts a shell for
@@ -80,16 +96,22 @@ mirror build is available. Useful options are:
 
 | Option | Purpose |
 | --- | --- |
+| `--relay` | Run the Relay authority on TCP port 8742; this is the default |
+| `--offload --device address` | Run the current physical-3DS rollback transport |
 | `--cwd /path/to/project` | Working directory for new shells |
 | `--shell /bin/zsh` | Shell executable |
 | `--no-login` | Start the shell without login mode |
 | `--no-mirror` | Use the handheld without opening Mac windows |
 | `--name name` | Companion name |
-| `--key /path/to/key` | Pairing key; defaults to `.pocket/offload.key` |
+| `--key /path/to/key` | Companion key used by either transport; defaults to `.pocket/offload.key` |
 | `--trace` | Log command kinds and session changes, without typed text |
 
-`--unicast` is an alias for `--device`. The pairing key belongs to this app;
-keep the Mac's `.pocket/offload.key` when updating an existing installation.
+`--unicast` is an alias for `--device` in offload mode. Relay rejects both
+address flags because it listens for an authenticated connection on port
+8742. Run `bun run pair --host <console-ip>` while ftpd is active to provision
+the development key and the app-specific companion key. The latter belongs
+to this app and is reused for Relay authentication despite its legacy
+`.pocket/offload.key` filename; keep it when updating an installation.
 
 **A Wi-Fi or provider reconnect preserves PTYs while the Node worker remains
 alive. Stopping the companion ends its sessions.** Reconnect persistence is
@@ -131,13 +153,15 @@ for the confirmation rules and measured queue behavior.
 
 ```text
 3DS UI and bounded row cache
-        │ paired PocketJS io.offload
+        │ paired PocketJS Relay record lane
         ▼
-Bun provider worker ── authenticated loopback ── Node terminal worker
-                                                 ├─ PTYs + libghostty
-                                                 ├─ session and history registry
-                                                 ├─ dynamic glyph rasterization
-                                                 └─ session-specific Mac mirrors
+Node Relay authority (TCP 8742) + durable terminal worker
+        ├─ PTYs + libghostty
+        ├─ session and history registry
+        ├─ dynamic glyph rasterization
+        └─ session-specific Mac mirrors
+
+Explicit rollback: 3DS io.offload -> Bun provider -> Node terminal worker
 ```
 
 **The Node worker owns terminal state; the 3DS owns presentation and input.**
@@ -146,13 +170,14 @@ rasterize outline fonts. PocketJS delivers asynchronous results at frame
 boundaries. Complete grid generations commit together; historical rows are
 published into a bounded cache with a separate per-frame work limit.
 
-Three independent request paths keep input responsive:
+Relay separates the four product data paths:
 
-| Request | Contract |
+| Path | Contract |
 | --- | --- |
-| `term.input` | Ordered input batches with command ids; lost replies retry the same ids |
-| `term.exchange` | Live grid and glyph fragments retained until acknowledged |
-| `term.history.batch` | Up to 16 historical rows per request, with two requests in flight |
+| `x.term.*` private operations | Ordered input batches with monotonic ids; epoch operations deduplicate keys and durable `new`/`kill` reconcile uncertain results through `operation.status` |
+| `TERMINAL_CELLS` subscription | Whole-row live diffs with generation, sequence, cursor and input acknowledgement |
+| `resource.get` history pages | Session, history epoch and absolute-row identity; at most 16 rows per request |
+| `FILE` with `FONT3` | One complete bounded atlas; slot 19–23 changes invalidate and refetch the resource |
 
 An output reply cannot hold the input ticket. Cache keys include the session,
 history epoch and absolute row; reset, pruning and alternate-screen transitions
@@ -170,7 +195,8 @@ The provider ownership follows [Pocket Doc](https://github.com/pocket-stack/pock
 Public PocketJS APIs own runtime, input and host operations; Solid owns
 reactivity. Product protocol and budgets live in `shared/`, the handheld in
 `app/`, and terminal capabilities in `host/`. Mac mirror listeners bind only
-to loopback; LAN terminal access uses paired offload.
+to loopback; LAN terminal access is authenticated with the app-specific
+companion key.
 
 ## Updating and troubleshooting
 
@@ -180,27 +206,32 @@ Pull the latest main, update the submodule, run setup and rebuild:
 git pull --ff-only
 git submodule update --init
 bun run setup
-bun run 3ds
+bun run 3ds --offload           # required by the current physical 3DS host
 bun run mirror
 ```
 
-Then exit Pocket Term, start ftpd, and run `deploy` again. **The offload
-launcher boots its embedded package**, so updates require replacing the
-`.3dsx`. The old `push` and `probe` commands apply to the earlier svc launcher.
+Then exit Pocket Term, start ftpd, and run `deploy` again. **The current
+offload rollback launcher boots its embedded package**, so updates require
+replacing the `.3dsx`. The old `push` and `probe` commands apply to the earlier
+svc launcher.
 Upgrade the guest and companion together when the protocol changes; current
 builds use **protocol 6**. The old svc key does not replace the offload key.
 
-If the device stays disconnected, check that ftpd has exited, the companion
-uses the console's current IP, and `.pocket/offload.key` matches the deployed
-key. Return to HBL with L + R + START before transferring another build.
+If the device stays disconnected in the current hardware configuration,
+check that both artifact and daemon selected `--offload`, ftpd has exited, the
+companion uses the console's current IP, and `.pocket/offload.key` matches the
+deployed key. A Relay artifact cannot connect through the pinned 3DS host.
+Return to HBL with L + R + START before transferring another build.
 The app's runtime storage is isolated under
 `/pocketjs/runtime/apps/22a222ca7b6bddb1/`.
 
 ## Development and validation
 
 ```sh
-bun run check                # guest/host types and terminal unit tests
+bun run check --relay        # guest/host types and shared Relay/offload tests
+bun run check --offload      # same gate with the rollback selection explicit
 bun run test:pty             # actual providers, macOS PTYs and VT behavior
+bun run bench:relay          # repeatable frame and wire-byte comparison
 bun scripts/font.ts --check  # reproduce all three shipped bitmap atlases
 bun run visual --showcase    # build the documentation capture fixture
 bun run visual --showcase --settings

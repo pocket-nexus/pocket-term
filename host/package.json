@@ -4,7 +4,7 @@
   "description": "Paired offload provider and durable Node PTY sessions for Pocket Term, with libghostty and loopback desktop mirrors.",
   "type": "module",
   "scripts": {
-    "serve": "node serve.ts"
+    "serve": "node --experimental-transform-types serve.ts"
   },
   "dependencies": {
     "@wterm/ghostty": "^0.3.4",

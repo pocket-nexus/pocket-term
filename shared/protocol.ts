@@ -1,8 +1,9 @@
 // shared/protocol.ts — the terminal wire protocol, shared verbatim by the
 // guest app (this directory) and the Mac companion daemon (host/serve.ts).
 //
-// The terminal worker emits bounded JSON lines
-// carried by authenticated offload exchanges (3DS) or loopback svc mirrors.
+// The terminal worker emits bounded JSON lines. Relay carries grid objects,
+// resource pages and private input requests; authenticated offload exchanges
+// remain the explicit rollback path, and loopback svc serves mirrors.
 // The companion holds the PTYs and an
 // authoritative terminal state machine per session; the device renders a
 // passive cell-grid replica. Attach delivers a full grid snapshot, everything
@@ -135,6 +136,43 @@ export type ClientLine =
   | { t: "scroll"; d: number }
   | { t: "glyphs"; one: string; two: string; reset?: 1; more?: 1 }
   | { t: "resync" };
+
+/** Product-level validation shared by both transports. Relay's negotiated
+ * schema bounds UTF-8 bytes; these checks retain the terminal protocol's
+ * UTF-16/codepoint limits before an operation can execute a PTY effect. */
+export function validateClientLine(line: ClientLine): void {
+  if (!line || typeof line !== "object") throw new Error("Invalid terminal command");
+  const integer = (n: unknown, min: number, max: number) =>
+    typeof n === "number" && Number.isInteger(n) && n >= min && n <= max;
+  switch (line.t) {
+    case "hello":
+      if (line.proto !== TERM_PROTO || !integer(line.cols, 20, 200) || !integer(line.rows, 5, 80) ||
+          (line.role !== undefined && line.role !== "device" && line.role !== "mirror") ||
+          (line.cell && (!integer(line.cell[0], 1, 32) || !integer(line.cell[1], 1, 40)))) {
+        throw new Error("Invalid terminal dimensions");
+      }
+      return;
+    case "ch": case "paste":
+      if (typeof line.s !== "string" || line.s.length > 256) throw new Error("Input exceeds budget");
+      if (line.t === "paste" && !["start", "more", "end", "single"].includes(line.phase)) throw new Error("Invalid paste phase");
+      return;
+    case "key":
+      if (typeof line.k !== "string" || line.k.length > 16) throw new Error("Invalid key");
+      return;
+    case "glyphs":
+      if (typeof line.one !== "string" || typeof line.two !== "string" || line.one.length + line.two.length > 448 ||
+          [...line.one, ...line.two].length > 224) throw new Error("Glyph demand exceeds budget");
+      return;
+    case "kill": case "attach":
+      if (!integer(line.sid, 1, Number.MAX_SAFE_INTEGER)) throw new Error("Invalid session");
+      return;
+    case "scroll":
+      if (!integer(line.d, -2000, 2000)) throw new Error("Invalid scroll");
+      return;
+    case "new": case "resync": return;
+    default: throw new Error("Unknown terminal command");
+  }
+}
 
 /** host -> device */
 export type HostLine =

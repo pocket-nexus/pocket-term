@@ -9,6 +9,9 @@ import { BTN } from "@pocketjs/framework/input";
 import { TermGrid } from "./grid.tsx";
 import { KB_H, Keyboard } from "./keyboard.tsx";
 import { connectTermOffload } from "./offload.ts";
+import { connectTermRelay } from "./relay.ts";
+import { config } from "./config.ts";
+import type { TermTransport } from "../shared/transport.ts";
 import { FONT_NAMES, loadTerminalFont } from "./font.ts";
 import { TERM_LAYOUT, TABS_PER_PAGE, tabPage } from "../shared/layout.ts";
 import { createTermStore, type TermStore } from "./store.ts";
@@ -43,10 +46,12 @@ const DPAD_KEYS: readonly [number, "Up" | "Down" | "Left" | "Right"][] = [
 const DPAD_DELAY = 18;
 const DPAD_REPEAT = 4;
 
-export default function TermApp(props: { store?: TermStore; initialSettings?: boolean } = {}) {
+export default function TermApp(props: { store?: TermStore; initialSettings?: boolean; transport?: TermTransport } = {}) {
   loadTerminalFont();
   const { cols: COLS, rows: ROWS, cellW: CELL_W, cellH: CELL_H, track: TRACK, statusH: STATUS_H } = TERM_LAYOUT;
-  const store = props.store ?? createTermStore({ cols: COLS, rows: ROWS, cell: [CELL_W, CELL_H] }, connectTermOffload());
+  const transport = props.transport ?? config.transport;
+  const store = props.store ?? createTermStore({ cols: COLS, rows: ROWS, cell: [CELL_W, CELL_H] },
+    transport === "relay" ? connectTermRelay() : connectTermOffload());
   onCleanup(() => store.dispose());
   const [page, setPage] = createSignal(0);
   const [fontIndex, setFontIndex] = createSignal(0);
