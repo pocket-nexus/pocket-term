@@ -120,9 +120,14 @@ const FLUSH_IDLE_MS = 100;
  * take the next output turn instead of waiting through a large atlas line. */
 const ATLAS_CHUNK = 1536;
 
+/** Transport ownership is independent of the device/mirror view role. */
+type ConnTransport =
+  | { kind: "pknt"; socket: Socket }
+  | { kind: "offload"; mailbox: Mailbox }
+  | { kind: "relay"; sink?: TermRelaySink };
+
 class Conn {
-  readonly socket: Socket;
-  mailbox?: Mailbox;
+  readonly transport: ConnTransport;
   readonly parser = new FrameParser();
   hello: Uint8Array | null = new Uint8Array(0);
   role: Role = "device";
@@ -151,22 +156,30 @@ class Conn {
   lastRx = Date.now();
   sawClientHello = false;
   paste?: { sid: number; text: string; at: number };
-  relaySink?: TermRelaySink;
-  readonly relayManaged: boolean;
   relayAck = 0;
 
-  constructor(socket: Socket, relaySink?: TermRelaySink) {
-    this.socket = socket;
-    this.relaySink = relaySink;
-    this.relayManaged = relaySink !== undefined;
+  constructor(transport: ConnTransport) {
+    this.transport = transport;
+  }
+
+  get mailbox(): Mailbox | undefined {
+    return this.transport.kind === "offload" ? this.transport.mailbox : undefined;
+  }
+
+  get relaySink(): TermRelaySink | undefined {
+    return this.transport.kind === "relay" ? this.transport.sink : undefined;
+  }
+
+  set relaySink(sink: TermRelaySink | undefined) {
+    if (this.transport.kind === "relay") this.transport.sink = sink;
   }
 
   sendLine(line: HostLine) {
-    if (this.relaySink) { this.relaySink.line(line); return; }
-    if (this.relayManaged) return;
-    if (this.mailbox) { this.mailbox.push(line); return; }
-    if (this.socket.writableLength > LIMITS.outputChars) { this.socket.destroy(); return; }
-    this.socket.write(encodeCtrl(JSON.stringify(line)));
+    const transport = this.transport;
+    if (transport.kind === "relay") { transport.sink?.line(line); return; }
+    if (transport.kind === "offload") { transport.mailbox.push(line); return; }
+    if (transport.socket.writableLength > LIMITS.outputChars) { transport.socket.destroy(); return; }
+    transport.socket.write(encodeCtrl(JSON.stringify(line)));
   }
 
   /** Emit rows (+cursor/scrollback trailer) as ordered, chunked grid lines. */
@@ -253,7 +266,7 @@ class Hub {
         // A mirror exists to show one session. When that session is over so
         // is the window: it is closed rather than pointed at someone else's
         // shell.
-        conn.socket.destroy();
+        if (conn.transport.kind === "pknt") conn.transport.socket.destroy();
         this.conns.delete(conn);
         continue;
       }
@@ -501,7 +514,7 @@ function handleLine(conn: Conn, line: ClientLine) {
         const sid = conn.mirrorSid ?? line.want;
         const session = sid === undefined ? undefined : hub.sessions.get(sid);
         if (!session) {
-          conn.socket.destroy();
+          if (conn.transport.kind === "pknt") conn.transport.socket.destroy();
           hub.conns.delete(conn);
           return;
         }
@@ -609,7 +622,7 @@ function acceptSocket(socket: Socket, mirrorSid?: number) {
   if (hub.conns.size >= 64) { socket.destroy(); return; }
   socket.setTimeout(15000, () => socket.destroy());
   socket.setNoDelay(true);
-  const conn = new Conn(socket);
+  const conn = new Conn({ kind: "pknt", socket });
   conn.mirrorSid = mirrorSid;
 
   socket.on("data", (chunk: Buffer) => {
@@ -661,16 +674,19 @@ let pingToken = 1;
 setInterval(() => {
   const now = Date.now();
   for (const conn of hub.conns) {
-    if (conn.mailbox) continue;
+    // Only PKNT sockets exchange these ping/pong frames and update lastRx.
+    // Relay and offload replicas retain their own lifetime and flow control.
+    if (conn.transport.kind !== "pknt") continue;
+    const socket = conn.transport.socket;
     if (now - conn.lastRx > SILENCE_TIMEOUT_MS) {
       console.log("[term] device silent, dropping");
-      conn.socket.destroy();
+      socket.destroy();
       hub.conns.delete(conn);
       continue;
     }
     const token = new Uint8Array(4);
     new DataView(token.buffer).setUint32(0, pingToken++ >>> 0, true);
-    conn.socket.write(encodeFrame(WIRE_MSG.ping, token));
+    socket.write(encodeFrame(WIRE_MSG.ping, token));
   }
 }, PING_INTERVAL_MS);
 
@@ -864,8 +880,8 @@ const broker = createHttpServer(async (request, response) => {
       if (replicas.size >= LIMITS.replicas) throw new Error("Replica limit reached");
       // This adapter owns no socket; PTYs and views remain in the same hub
       // as the loopback desktop mirrors.
-      conn = new Conn({ destroy() {}, writableLength: 0 } as unknown as Socket);
-      conn.mailbox = new Mailbox(); replicas.set(input.replica, conn); hub.conns.add(conn);
+      conn = new Conn({ kind: "offload", mailbox: new Mailbox() });
+      replicas.set(input.replica, conn); hub.conns.add(conn);
     }
     const reply = request.url === "/input"
       ? conn.mailbox!.input(input as unknown as import("../shared/exchange.ts").InputRequest, `${epoch}-${conn.mailbox!.identity}`, line => handleLine(conn!, line))
@@ -911,7 +927,7 @@ function createRelayReplica(ns: string, _peer: unknown, sink: TermRelaySink): Te
   let held = relayReplicas.get(ns);
   if (!held) {
     if (relayReplicas.size >= LIMITS.replicas) throw new Error("Relay replica limit reached");
-    const conn = new Conn({ destroy() {}, writableLength: 0 } as unknown as Socket, sink);
+    const conn = new Conn({ kind: "relay", sink });
     held = { conn, touched: Date.now() }; relayReplicas.set(ns, held); hub.conns.add(conn);
   }
   const conn = held.conn; conn.relaySink = sink; held.touched = Date.now();
