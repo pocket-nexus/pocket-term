@@ -71,7 +71,7 @@ export const TERM_RESOURCE_FORMS: readonly RelayResourceForm[] = [
   { profile: TERM_PROFILE, kind: RELAY_KIND.TERMINAL_CELLS },
   { profile: TERM_PROFILE, kind: RELAY_KIND.FILE, argsKey: "term",
     args: object({ sid: integer(1), epoch, rows: array(integer(), 16, 1), offset: integer(0, 16383) }) },
-  { profile: TERM_PROFILE, kind: RELAY_KIND.EVENT, value: object({ boot: string(32, 1), name: string(256),
+  { profile: TERM_PROFILE, kind: RELAY_KIND.EVENT, valuePresence: "required", value: object({ boot: string(32, 1), name: string(256),
     proto: integer(), active: integer(-1), ack: integer(), bell: integer(),
     sessions: array(object({ sid: integer(1), title: string(256) }), 32),
     fonts: array(object({ slot: integer(19, 23), gen: integer() }), 5),
