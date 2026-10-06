@@ -45,7 +45,7 @@ container. Install that pinned toolchain with its `rust-src` component if
 rustup has not already provisioned it.
 
 ```sh
-git clone --recursive https://github.com/pocket-stack/pocket-term
+git clone --recursive https://github.com/pocket-nexus/pocket-term
 cd pocket-term
 bun run setup
 bun run 3ds
@@ -166,7 +166,7 @@ runtime's one-record-per-frame delivery limit are documented in
 [history throughput](docs/HISTORY-THROUGHPUT.md). They do not imply a physical
 Wi-Fi throughput or a guaranteed frame rate.
 
-The provider ownership follows [Pocket Doc](https://github.com/pocket-stack/pocket-doc).
+The provider ownership follows [Pocket Doc](https://github.com/pocket-nexus/pocket-doc).
 Public PocketJS APIs own runtime, input and host operations; Solid owns
 reactivity. Product protocol and budgets live in `shared/`, the handheld in
 `app/`, and terminal capabilities in `host/`. Mac mirror listeners bind only
