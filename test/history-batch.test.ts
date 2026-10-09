@@ -17,7 +17,7 @@ function transport() {
 
 test("sixteen independent row loads use one reply and retain exact identities", () => {
   const t = transport(), values = new Map<number, string>();
-  for (let row = 10; row < 26; row++) t.loader.load({ sid: 1, epoch: "a", row }, r => { if (r.ok) values.set(row, r.value); });
+  for (let row = 10; row < 26; row++) t.loader.load({ sid: 1, epoch: "a", row }, r => { if (r.ok && "value" in r) values.set(row, r.value); });
   t.loader.step(true); expect(t.requests).toHaveLength(1); t.answer(0);
   expect(values.size).toBe(0); t.loader.publish(); expect(values.size).toBe(8); t.loader.publish();
   expect(values.size).toBe(16); expect(decodeHistoryRow(values.get(25)!)[0][1]).toBe("row-25");

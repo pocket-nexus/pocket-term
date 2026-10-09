@@ -22,7 +22,8 @@ if (existsSync(vendorKeys)) {
   }
 }
 
-// io.offload uses an app-scoped key, separate from the development service.
+// The companion transports share one app-scoped key, separate from the
+// development service. The filename is retained for deployed compatibility.
 const argv = process.argv.slice(2);
 const address = argv[argv.indexOf("--host") + 1];
 if (!argv.includes("--host") || !address) throw new Error("Expected --host <console-ip>");

@@ -2,12 +2,14 @@ import { batch, createSignal, onCleanup, type Accessor } from "solid-js";
 import { createScroller } from "@pocketjs/framework/kinetics";
 import { createResourceScheduler } from "@pocketjs/framework/resource-cache";
 import type { ResourceDemand, ResourceLoad } from "@pocketjs/framework/resource-cache";
-import type { createOffloadClient } from "@pocketjs/framework/offload";
 import { HISTORY, HISTORY_BATCH, decodeHistoryRow, historyKey, validManifest, type HistoryInput, type HistoryManifest, type HistoryReply } from "../shared/history.ts";
 import type { Run } from "../shared/protocol.ts";
 import { createHistoryBatchLoader } from "./history-batch.ts";
 
-export type HistoryIO = Pick<ReturnType<typeof createOffloadClient>, "request" | "cancel">;
+export interface HistoryIO {
+  request(method: string, payload: string, callback: (result: { ok: true; value: string } | { ok: false; error: unknown }) => void): number;
+  cancel(id: number): void;
+}
 
 /** Reads have their own cancellable tickets; they never wait behind queued
  * terminal input and can never execute a PTY mutation on retry. */

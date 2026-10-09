@@ -17,7 +17,7 @@ import {
   type SessionInfo,
   isDynamicSlot,
 } from "../shared/protocol.ts";
-import type { TermChannel } from "./channel.ts";
+import type { TermChannel, TermChannelEvent } from "./channel.ts";
 import { createTermHistory, type TermHistory } from "./history.ts";
 import { createTypingPrediction, type TypingPreview } from "./prediction.ts";
 
@@ -209,6 +209,17 @@ export function createTermStore(options: TermStoreOptions, svc: TermChannel | nu
     setDynamicGlyphs(total);
   };
 
+  const applyFont = (line: Extract<TermChannelEvent, { t: "font" }>) => {
+    const blob = line.data, load = getOps().loadFontAtlas;
+    if (!load || blob.length < 16) return;
+    load(blob);
+    const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength), count = view.getUint16(6, true);
+    coverage.set(line.slot, new Set(Array.from({ length: count }, (_, n) => view.getUint32(16 + n * 8, true))));
+    glyphCounts.set(line.slot, count);
+    let total = 0; for (const value of glyphCounts.values()) total += value;
+    setDynamicGlyphs(total); setAtlasVersion(n => n + 1);
+  };
+
   const applyGrid = (line: Extract<HostLine, { t: "grid" }>) => {
     if (line.sid !== activeSid() && activeSid() !== -1) return;
     if (line.gen < gen) return;
@@ -290,7 +301,7 @@ export function createTermStore(options: TermStoreOptions, svc: TermChannel | nu
     else if (lines !== 0) svc?.send({ t: "scroll", d: lines });
   };
 
-  const apply = (line: HostLine | HostInputLine) => {
+  const apply = (line: TermChannelEvent) => {
     switch (line.t) {
       case "transport-reset":
         gen = -1; seq = -1; staged = undefined; sawGrid = false;
@@ -359,6 +370,9 @@ export function createTermStore(options: TermStoreOptions, svc: TermChannel | nu
       case "atlas":
         applyAtlas(line);
         break;
+      case "font":
+        applyFont(line);
+        break;
       case "exit":
         // The host follows with a sessions line; nothing to do locally.
         break;
@@ -424,6 +438,7 @@ export function createTermStore(options: TermStoreOptions, svc: TermChannel | nu
         return;
       }
       if (conn() !== "live" || !sawGrid) setConn(sawGrid ? "live" : "link");
+      svc.step?.();
       for (const line of svc.poll()) apply(line);
       history?.setOnline(sawGrid && conn() === "live"); history?.frame();
     },

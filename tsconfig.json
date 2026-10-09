@@ -27,6 +27,12 @@
       ],
       "@pocketjs/framework/offload/provider": [
         "./vendor/pocketjs/tools/offload-provider.ts"
+      ],
+      "@pocketjs/framework/relay/spec": [
+        "./vendor/pocketjs/contracts/spec/relay.ts"
+      ],
+      "@pocketjs/framework/relay/wire": [
+        "./vendor/pocketjs/tools/relay-wire.ts"
       ]
     }
   },

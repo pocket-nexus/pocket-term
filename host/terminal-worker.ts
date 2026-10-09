@@ -26,10 +26,13 @@ import {
   type RowUpdate,
   type Run,
   type SessionInfo,
+  validateClientLine,
 } from "../shared/protocol.ts";
 import { chunkRows, resolveCell, rowKey, rowRuns, type Cell } from "./grid.ts";
 import { DynamicAtlasSet, isBakedCodepoint } from "./glyphs.ts";
 import { encodeKey } from "./keys.ts";
+import { serveTermRelay, type TermRelayReplica, type TermRelaySink } from "./relay-host.ts";
+import { TermOperationJournal } from "./relay-journal.ts";
 import {
   FrameParser,
   WIRE_MSG,
@@ -117,9 +120,14 @@ const FLUSH_IDLE_MS = 100;
  * take the next output turn instead of waiting through a large atlas line. */
 const ATLAS_CHUNK = 1536;
 
+/** Transport ownership is independent of the device/mirror view role. */
+type ConnTransport =
+  | { kind: "pknt"; socket: Socket }
+  | { kind: "offload"; mailbox: Mailbox }
+  | { kind: "relay"; sink?: TermRelaySink };
+
 class Conn {
-  readonly socket: Socket;
-  mailbox?: Mailbox;
+  readonly transport: ConnTransport;
   readonly parser = new FrameParser();
   hello: Uint8Array | null = new Uint8Array(0);
   role: Role = "device";
@@ -148,15 +156,30 @@ class Conn {
   lastRx = Date.now();
   sawClientHello = false;
   paste?: { sid: number; text: string; at: number };
+  relayAck = 0;
 
-  constructor(socket: Socket) {
-    this.socket = socket;
+  constructor(transport: ConnTransport) {
+    this.transport = transport;
+  }
+
+  get mailbox(): Mailbox | undefined {
+    return this.transport.kind === "offload" ? this.transport.mailbox : undefined;
+  }
+
+  get relaySink(): TermRelaySink | undefined {
+    return this.transport.kind === "relay" ? this.transport.sink : undefined;
+  }
+
+  set relaySink(sink: TermRelaySink | undefined) {
+    if (this.transport.kind === "relay") this.transport.sink = sink;
   }
 
   sendLine(line: HostLine) {
-    if (this.mailbox) { this.mailbox.push(line); return; }
-    if (this.socket.writableLength > LIMITS.outputChars) { this.socket.destroy(); return; }
-    this.socket.write(encodeCtrl(JSON.stringify(line)));
+    const transport = this.transport;
+    if (transport.kind === "relay") { transport.sink?.line(line); return; }
+    if (transport.kind === "offload") { transport.mailbox.push(line); return; }
+    if (transport.socket.writableLength > LIMITS.outputChars) { transport.socket.destroy(); return; }
+    transport.socket.write(encodeCtrl(JSON.stringify(line)));
   }
 
   /** Emit rows (+cursor/scrollback trailer) as ordered, chunked grid lines. */
@@ -172,7 +195,7 @@ class Conn {
         ...(full ? { full: 1 as const } : {}),
         ...(last ? {} : { more: 1 as const }),
         rows: chunks[i],
-        ...(last ? { cur: cursor, ack: this.mailbox?.ack, sb: this.scrollback, history: hub.sessions.get(this.attachedSid)?.history.manifest() } : {}),
+        ...(last ? { cur: cursor, ack: this.mailbox?.ack ?? this.relayAck, sb: this.scrollback, history: hub.sessions.get(this.attachedSid)?.history.manifest() } : {}),
       });
     }
   }
@@ -243,7 +266,7 @@ class Hub {
         // A mirror exists to show one session. When that session is over so
         // is the window: it is closed rather than pointed at someone else's
         // shell.
-        conn.socket.destroy();
+        if (conn.transport.kind === "pknt") conn.transport.socket.destroy();
         this.conns.delete(conn);
         continue;
       }
@@ -369,6 +392,12 @@ function pumpAtlasBake(): void {
  *  delivered, one slot at a time. */
 function pumpAtlasSend(conn: Conn): void {
   if (!conn.sawClientHello) return;
+  if (conn.relaySink) {
+    for (const baked of atlas.current()) if (conn.atlasSent.get(baked.slot) !== baked.gen) {
+      conn.atlasSent.set(baked.slot, baked.gen); conn.relaySink.font(baked.slot, baked.gen);
+    }
+    return;
+  }
   if (conn.atlasQueue.length === 0) {
     for (const baked of atlas.current()) {
       if (conn.atlasSent.get(baked.slot) === baked.gen) continue;
@@ -485,7 +514,7 @@ function handleLine(conn: Conn, line: ClientLine) {
         const sid = conn.mirrorSid ?? line.want;
         const session = sid === undefined ? undefined : hub.sessions.get(sid);
         if (!session) {
-          conn.socket.destroy();
+          if (conn.transport.kind === "pknt") conn.transport.socket.destroy();
           hub.conns.delete(conn);
           return;
         }
@@ -593,7 +622,7 @@ function acceptSocket(socket: Socket, mirrorSid?: number) {
   if (hub.conns.size >= 64) { socket.destroy(); return; }
   socket.setTimeout(15000, () => socket.destroy());
   socket.setNoDelay(true);
-  const conn = new Conn(socket);
+  const conn = new Conn({ kind: "pknt", socket });
   conn.mirrorSid = mirrorSid;
 
   socket.on("data", (chunk: Buffer) => {
@@ -645,16 +674,19 @@ let pingToken = 1;
 setInterval(() => {
   const now = Date.now();
   for (const conn of hub.conns) {
-    if (conn.mailbox) continue;
+    // Only PKNT sockets exchange these ping/pong frames and update lastRx.
+    // Relay and offload replicas retain their own lifetime and flow control.
+    if (conn.transport.kind !== "pknt") continue;
+    const socket = conn.transport.socket;
     if (now - conn.lastRx > SILENCE_TIMEOUT_MS) {
       console.log("[term] device silent, dropping");
-      conn.socket.destroy();
+      socket.destroy();
       hub.conns.delete(conn);
       continue;
     }
     const token = new Uint8Array(4);
     new DataView(token.buffer).setUint32(0, pingToken++ >>> 0, true);
-    conn.socket.write(encodeFrame(WIRE_MSG.ping, token));
+    socket.write(encodeFrame(WIRE_MSG.ping, token));
   }
 }, PING_INTERVAL_MS);
 
@@ -678,6 +710,7 @@ function flushAll(): void {
     }
   }
   pumpAtlasBake();
+  relayAuthority?.pump();
 }
 
 /** Ask for a pass shortly. Output is what makes a session worth serializing,
@@ -762,6 +795,7 @@ function closeAllMirrors(): void {
 
 for (const signal of ["exit", "SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
+    relayAuthority?.close();
     closeAllMirrors();
     for (const session of hub.sessions.values()) session.dispose();
     if (signal !== "exit") process.exit(0);
@@ -794,7 +828,7 @@ console.log(`[term] shell ${options.shell}, host name "${options.name}"`);
 
 // Authenticated local capability broker. The LAN transport only forwards to
 // this process; reconnecting its worker never tears down a PTY.
-const epoch = randomUUID(), token = randomBytes(32).toString("hex");
+const epoch = randomUUID(), relayBoot = randomBytes(16).toString("hex"), token = randomBytes(32).toString("hex");
 const replicas = new Map<string, Conn>();
 const broker = createHttpServer(async (request, response) => {
   if (request.method !== "POST" || !["/exchange", "/history", "/history-batch", "/input"].includes(request.url ?? "") || request.headers.authorization !== `Bearer ${token}`) {
@@ -809,18 +843,7 @@ const broker = createHttpServer(async (request, response) => {
     if (request.url === "/history-batch") {
       const input = JSON.parse(body) as HistoryBatchRequest;
       validateHistoryBatch(input);
-      const session = hub.sessions.get(input.sid);
-      if (!session?.core) throw new Error("Terminal no longer exists");
-      // Validate every address before reading any cells. Appends preserve
-      // absolute rows; pruning or a changed epoch rejects the batch.
-      for (const row of input.rows) session.history.offset(row, input.epoch);
-      const reply = historyBatchReply(input, row => {
-        const offset = session.history.offset(row, input.epoch), cells: Cell[] = [];
-        for (let x = 0; x < session.cols; x++) {
-          const cell = resolveCell(session.core!.getScrollbackCell(offset, x)); classify(cell, false); cells.push(cell);
-        }
-        return JSON.stringify(rowRuns(cells));
-      });
+      const reply = readHistoryBatch(input);
       response.setHeader("content-type", "application/json"); response.end(JSON.stringify(reply));
       return;
     }
@@ -857,8 +880,8 @@ const broker = createHttpServer(async (request, response) => {
       if (replicas.size >= LIMITS.replicas) throw new Error("Replica limit reached");
       // This adapter owns no socket; PTYs and views remain in the same hub
       // as the loopback desktop mirrors.
-      conn = new Conn({ destroy() {}, writableLength: 0 } as unknown as Socket);
-      conn.mailbox = new Mailbox(); replicas.set(input.replica, conn); hub.conns.add(conn);
+      conn = new Conn({ kind: "offload", mailbox: new Mailbox() });
+      replicas.set(input.replica, conn); hub.conns.add(conn);
     }
     const reply = request.url === "/input"
       ? conn.mailbox!.input(input as unknown as import("../shared/exchange.ts").InputRequest, `${epoch}-${conn.mailbox!.identity}`, line => handleLine(conn!, line))
@@ -880,30 +903,56 @@ setInterval(() => {
       replicas.delete(id); hub.conns.delete(conn);
     }
   }
+  for (const [id, held] of relayReplicas) if (!held.conn.relaySink && Date.now() - held.touched > 30 * 60 * 1000) {
+    relayReplicas.delete(id); hub.conns.delete(held.conn);
+  }
 }, 60000).unref();
 
-function validateClientLine(line: ClientLine) {
-  if (!line || typeof line !== "object") throw new Error("Invalid terminal command");
-  const integer = (n: unknown, min: number, max: number) => typeof n === "number" && Number.isInteger(n) && n >= min && n <= max;
-  switch (line.t) {
-    case "hello":
-      if (!integer(line.cols, 20, 200) || !integer(line.rows, 5, 80) ||
-          (line.role !== undefined && line.role !== "device" && line.role !== "mirror") ||
-          (line.cell && (!integer(line.cell[0], 1, 32) || !integer(line.cell[1], 1, 40)))) throw new Error("Invalid terminal dimensions");
-      return;
-    case "ch": case "paste":
-      if (typeof line.s !== "string" || line.s.length > 256) throw new Error("Input exceeds budget");
-      if (line.t === "paste" && !["start", "more", "end", "single"].includes(line.phase)) throw new Error("Invalid paste phase");
-      return;
-    case "key":
-      if (typeof line.k !== "string" || line.k.length > 16) throw new Error("Invalid key"); return;
-    case "glyphs":
-      if (typeof line.one !== "string" || typeof line.two !== "string" || line.one.length + line.two.length > 448 || [...line.one, ...line.two].length > 224) throw new Error("Glyph demand exceeds budget"); return;
-    case "kill": case "attach":
-      if (!integer(line.sid, 1, Number.MAX_SAFE_INTEGER)) throw new Error("Invalid session"); return;
-    case "scroll":
-      if (!integer(line.d, -2000, 2000)) throw new Error("Invalid scroll"); return;
-    case "new": case "resync": return;
-    default: throw new Error("Unknown terminal command");
+function readHistoryBatch(input: HistoryBatchRequest): ReturnType<typeof historyBatchReply> {
+  validateHistoryBatch(input);
+  const session = hub.sessions.get(input.sid);
+  if (!session?.core) throw new Error("Terminal no longer exists");
+  for (const row of input.rows) session.history.offset(row, input.epoch);
+  return historyBatchReply(input, row => {
+    const offset = session.history.offset(row, input.epoch), cells: Cell[] = [];
+    for (let x = 0; x < session.cols; x++) {
+      const cell = resolveCell(session.core!.getScrollbackCell(offset, x)); classify(cell, false); cells.push(cell);
+    }
+    return JSON.stringify(rowRuns(cells));
+  });
+}
+
+const relayReplicas = new Map<string, { conn: Conn; touched: number }>();
+function createRelayReplica(ns: string, _peer: unknown, sink: TermRelaySink): TermRelayReplica {
+  let held = relayReplicas.get(ns);
+  if (!held) {
+    if (relayReplicas.size >= LIMITS.replicas) throw new Error("Relay replica limit reached");
+    const conn = new Conn({ kind: "relay", sink });
+    held = { conn, touched: Date.now() }; relayReplicas.set(ns, held); hub.conns.add(conn);
   }
+  const conn = held.conn; conn.relaySink = sink; held.touched = Date.now();
+  return {
+    get ack() { return conn.relayAck; },
+    resume() { snapshot(conn); pumpAtlasSend(conn); },
+    state: () => ({
+      boot: relayBoot, name: options.name, proto: TERM_PROTO, active: conn.attachedSid, ack: conn.relayAck, bell: 0,
+      sessions: hub.list(), fonts: atlas.current().map(font => ({ slot: font.slot, gen: font.gen })),
+      ...(conn.attachedSid >= 0 && conn.gen > 0 ? { grid: { sid: conn.attachedSid, gen: conn.gen } } : {}),
+    }),
+    apply(line, id) { conn.relayAck = id; held!.touched = Date.now(); handleLine(conn, line); },
+    history: readHistoryBatch,
+    font(slot) { const current = atlas.current().find(font => font.slot === slot); return current && { gen: current.gen, bytes: current.bytes }; },
+    close() { if (conn.relaySink === sink) conn.relaySink = undefined; held!.touched = Date.now(); },
+  };
+}
+
+let relayAuthority: Awaited<ReturnType<typeof serveTermRelay>>["authority"] | undefined;
+const relayKey = process.env.POCKET_TERM_RELAY_KEY;
+if (process.env.POCKET_TERM_TRANSPORT === "relay" && relayKey) {
+  const relay = await serveTermRelay({ key: relayKey, port: Number(process.env.POCKET_TERM_RELAY_PORT ?? 8742), host: "0.0.0.0",
+    store: new TermOperationJournal(process.env.POCKET_TERM_RELAY_JOURNAL ?? resolve(ROOT, ".pocket/relay-operations.json")),
+    createReplica: createRelayReplica, log: message => console.log(`[term] ${message}`) });
+  relayAuthority = relay.authority;
+  console.log(`[term] relay authority listening on tcp/${relay.port}`);
+  process.send?.({ relayReady: true, port: relay.port });
 }
